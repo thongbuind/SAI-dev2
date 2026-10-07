@@ -370,6 +370,60 @@ function bindFeedbackBtns(container) {
   })
 }
 
+function normalizeAIText(text) {
+  const normalizedNewlines = String(text ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\\r\\n|\\n|\\r/g, "\n")
+
+  let result = ""
+  let capitalizeNext = true
+
+  for (let i = 0; i < normalizedNewlines.length; i++) {
+    const char = normalizedNewlines[i]
+
+    if (/\p{L}/u.test(char)) {
+      result += capitalizeNext ? char.toLocaleUpperCase("vi-VN") : char
+      capitalizeNext = false
+      continue
+    }
+
+    result += char
+
+    if (/\p{N}/u.test(char)) {
+      capitalizeNext = false
+    } else if (char === "\n") {
+      capitalizeNext = true
+    } else if (char === ".") {
+      const previousChar = normalizedNewlines[i - 1] || ""
+      const nextChar = normalizedNewlines[i + 1] || ""
+      const isNumericSeparator = /\p{N}/u.test(previousChar) && /\p{N}/u.test(nextChar)
+      if (!isNumericSeparator) capitalizeNext = true
+    }
+  }
+
+  return result
+}
+
+function renderAIText(element, text) {
+  element.replaceChildren()
+
+  const boldPattern = /\*\*([\s\S]+?)\*\*/g
+  let cursor = 0
+  let match
+
+  while ((match = boldPattern.exec(text)) !== null) {
+    element.appendChild(document.createTextNode(text.slice(cursor, match.index)))
+
+    const strong = document.createElement("strong")
+    strong.textContent = match[1]
+    element.appendChild(strong)
+
+    cursor = match.index + match[0].length
+  }
+
+  element.appendChild(document.createTextNode(text.slice(cursor)))
+}
+
 function renderMessage(role, text, model) {
   if (role === "ai" && model) {
     const labelRow = document.createElement("div")
@@ -392,7 +446,7 @@ function renderMessage(role, text, model) {
 
     const bubble = document.createElement("div")
     bubble.className   = "bubble glass-bubble glass-content"
-    bubble.textContent = text
+    renderAIText(bubble, normalizeAIText(text))
     msgBody.appendChild(bubble)
 
     const feedback = document.createElement("div")
@@ -414,12 +468,14 @@ function renderMessage(role, text, model) {
 }
 
 function addMessage(role, text, model) {
-  currentMessages.push({ role, text, ...(model ? { model } : {}) })
-  renderMessage(role, text, model)
+  const normalizedText = role === "ai" ? normalizeAIText(text) : text
+  currentMessages.push({ role, text: normalizedText, ...(model ? { model } : {}) })
+  renderMessage(role, normalizedText, model)
 }
 
 function addAIMessageTypewriter(text, model) {
-  currentMessages.push({ role: "ai", text, ...(model ? { model } : {}) })
+  const normalizedText = normalizeAIText(text)
+  currentMessages.push({ role: "ai", text: normalizedText, ...(model ? { model } : {}) })
 
   if (model) {
     const labelRow = document.createElement("div")
@@ -454,8 +510,9 @@ function addAIMessageTypewriter(text, model) {
 
   let i = 0
   ;(function type() {
-    if (i < text.length) {
-      bubble.textContent += text[i++]
+    if (i < normalizedText.length) {
+      i++
+      renderAIText(bubble, normalizedText.slice(0, i))
       chatEl.scrollTop = chatEl.scrollHeight
       setTimeout(type, 18)
     }

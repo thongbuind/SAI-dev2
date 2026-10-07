@@ -226,6 +226,7 @@ html, body {
   border-radius: 3px 14px 14px 14px;
   padding: 10px 15px;
   text-align: justify;
+  white-space: pre-wrap;
   word-break: break-word;
   box-shadow: var(--ai-bubble-shadow);
 }
