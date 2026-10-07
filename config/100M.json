@@ -4,7 +4,8 @@
     "num_kv_heads": 6,
     "num_layers": 12,
     "ff_dim": 3072,
-    "batch_size": 20,
+    "batch_size": 64,
+    "max_microbatch_tokens": 16384,
     "freeze": [0, 1, 2],
     "num_workers": 4
 }

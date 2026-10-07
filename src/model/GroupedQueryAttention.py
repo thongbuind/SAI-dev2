@@ -5,7 +5,6 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from src.model.RotaryPositionalEmbedding import RotaryPositionalEmbedding
 
 _SDPA_BACKENDS = [
-    SDPBackend.CUDNN_ATTENTION,
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,

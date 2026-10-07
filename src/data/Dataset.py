@@ -5,6 +5,109 @@ import json
 from pathlib import Path
 from src.utils.utils import log_progress
 
+class RandomizedSortishBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, lengths, batch_size, pool_batches=50, drop_last=False, seed=None):
+        self.lengths = np.asarray(lengths)
+        self.batch_size = batch_size
+        self.pool_size = max(batch_size, batch_size * pool_batches)
+        self.drop_last = drop_last
+        self.seed = seed if seed is not None else int(
+            torch.empty((), dtype=torch.int64).random_().item()
+        )
+        self.epoch = 0
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return int(np.ceil(len(self.lengths) / self.batch_size))
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        shuffled_indices = rng.permutation(len(self.lengths))
+        self.epoch += 1
+
+        for pool_start in range(0, len(shuffled_indices), self.pool_size):
+            pool = shuffled_indices[pool_start:pool_start + self.pool_size]
+            length_order = np.argsort(self.lengths[pool], kind="stable")
+            sorted_pool = pool[length_order]
+
+            pool_batches = []
+            for batch_start in range(0, len(sorted_pool), self.batch_size):
+                batch = sorted_pool[batch_start:batch_start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batch = batch.tolist()
+                rng.shuffle(batch)
+                pool_batches.append(batch)
+
+            rng.shuffle(pool_batches)
+            yield from pool_batches
+
+class TokenBalancedSortishBatchSampler(torch.utils.data.Sampler):
+    def __init__(
+        self, lengths, loss_token_counts, batch_size, pool_batches=50,
+        max_samples=None, seed=None,
+    ):
+        self.lengths = np.asarray(lengths)
+        self.loss_token_counts = np.asarray(loss_token_counts, dtype=np.int64)
+        self.pool_size = max(batch_size, batch_size * pool_batches)
+        self.max_samples = max_samples or batch_size * 4
+        self.target_loss_tokens = max(
+            1, int(round(self.loss_token_counts.mean() * batch_size))
+        )
+        self.seed = seed if seed is not None else int(
+            torch.empty((), dtype=torch.int64).random_().item()
+        )
+        self.epoch = 0
+        self._cached_epoch = None
+        self._cached_batches = None
+
+    def _build_batches(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        shuffled_indices = rng.permutation(len(self.lengths))
+        batches = []
+        current_batch = []
+        current_loss_tokens = 0
+
+        for pool_start in range(0, len(shuffled_indices), self.pool_size):
+            pool = shuffled_indices[pool_start:pool_start + self.pool_size]
+            length_order = np.argsort(self.lengths[pool], kind="stable")
+            for idx in pool[length_order]:
+                if current_batch and (
+                    current_loss_tokens >= self.target_loss_tokens
+                    or len(current_batch) >= self.max_samples
+                ):
+                    rng.shuffle(current_batch)
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_loss_tokens = 0
+
+                current_batch.append(int(idx))
+                current_loss_tokens += int(self.loss_token_counts[idx])
+
+        if current_batch:
+            rng.shuffle(current_batch)
+            batches.append(current_batch)
+
+        rng.shuffle(batches)
+        return batches
+
+    def _get_batches(self):
+        if self._cached_epoch != self.epoch:
+            self._cached_batches = self._build_batches()
+            self._cached_epoch = self.epoch
+        return self._cached_batches
+
+    def __len__(self):
+        return len(self._get_batches())
+
+    def __iter__(self):
+        batches = self._get_batches()
+        self.epoch += 1
+        self._cached_epoch = None
+        self._cached_batches = None
+        yield from batches
+
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, X, Y, lengths, indices, loss_masks=None):
         self.X = X
@@ -26,7 +129,17 @@ class Dataset(torch.utils.data.Dataset):
         )
     
     @classmethod
-    def create_dataloader(cls, X, Y, lengths, batch_size, max_seq_len, num_workers, shuffle, loss_masks=None):
+    def create_dataloader(
+        cls, X, Y, lengths, batch_size, max_seq_len, num_workers, shuffle,
+        mode, loss_masks=None,
+    ):
+        if mode not in {"pretrain", "finetune"}:
+            raise ValueError(
+                f"mode phải là 'pretrain' hoặc 'finetune', nhận được: {mode!r}"
+            )
+        if mode == "finetune" and loss_masks is None:
+            raise ValueError("Finetune dataloader bắt buộc phải có loss_masks")
+
         log_progress(f"Đang tạo dataset từ {len(X)} samples...")
         indices = np.arange(len(X))
         dataset = cls(X, Y, lengths, indices, loss_masks)
@@ -73,18 +186,64 @@ class Dataset(torch.utils.data.Dataset):
 
             return X_padded, Y_padded, sample_weight, attention_mask, has_padding
 
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=collate_fn,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            persistent_workers = True,
-            drop_last=False
-        )
+        loader_kwargs = {
+            "dataset": dataset,
+            "collate_fn": collate_fn,
+            "num_workers": num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "persistent_workers": True,
+        }
 
-        log_progress(f"Dataset được tạo với batch_size={batch_size}")
+        if shuffle and mode == "pretrain":
+            batch_sampler = RandomizedSortishBatchSampler(
+                lengths=lengths,
+                batch_size=batch_size,
+                pool_batches=50,
+                drop_last=False,
+            )
+            dataloader = torch.utils.data.DataLoader(
+                batch_sampler=batch_sampler,
+                **loader_kwargs,
+            )
+            log_progress(
+                f"Sortish sampler: pool={batch_sampler.pool_size} samples, "
+                f"{len(batch_sampler)} batch/epoch"
+            )
+        elif shuffle and mode == "finetune":
+            loss_token_counts = np.fromiter(
+                (np.asarray(mask).sum() for mask in loss_masks),
+                dtype=np.int64,
+                count=len(loss_masks),
+            )
+            batch_sampler = TokenBalancedSortishBatchSampler(
+                lengths=lengths,
+                loss_token_counts=loss_token_counts,
+                batch_size=batch_size,
+                pool_batches=50,
+                max_samples=batch_size * 4,
+            )
+            dataloader = torch.utils.data.DataLoader(
+                batch_sampler=batch_sampler,
+                **loader_kwargs,
+            )
+            log_progress(
+                f"SFT token-balanced sortish: target={batch_sampler.target_loss_tokens:,} "
+                f"loss-token/batch, pool={batch_sampler.pool_size}, "
+                f"max_samples={batch_sampler.max_samples}, "
+                f"{len(batch_sampler)} batch/epoch"
+            )
+        else:
+            length_order = np.argsort(np.asarray(lengths), kind="stable")
+            batch_sampler = [
+                length_order[i:i + batch_size].tolist()
+                for i in range(0, len(length_order), batch_size)
+            ]
+            dataloader = torch.utils.data.DataLoader(
+                batch_sampler=batch_sampler,
+                **loader_kwargs,
+            )
+
+        log_progress(f"Dataset mode={mode}, batch_size={batch_size}")
         return dataloader
 
 def split_train_val_test(X, Y, loss_masks, lengths, train_ratio, val_ratio, seed=54):
@@ -117,7 +276,6 @@ def split_train_val_test(X, Y, loss_masks, lengths, train_ratio, val_ratio, seed
                 X_test, Y_test, None, lengths_test)
 
 def _load_single_npz(path, load_mask=False):
-    """Bản gốc: đọc 1 file .npz duy nhất."""
     f = np.load(path)
     def reconstruct(name):
         flat, offsets = f[f"{name}_flat"], f[f"{name}_offsets"]
@@ -162,10 +320,6 @@ def _load_manifest_shards(manifest_path, load_mask=False):
     return X, Y, lengths
 
 def load_npz(path, load_mask=False):
-    """
-    - path là file .json -> manifest nhiều shard, tự đọc & ghép tất cả.
-    - path là file .npz -> đọc 1 file như bản gốc.
-    """
     path = Path(path)
     if path.suffix == ".json":
         return _load_manifest_shards(path, load_mask=load_mask)
@@ -223,7 +377,7 @@ def load_data(data_type, main_data, sub_data=None, seed=54):
         if sub_data is not None:
             X_sub, Y_sub, M_sub, L_sub = load_npz(sub_data, load_mask=True)
 
-            n_sub = len(X_main) * 3
+            n_sub = len(X_main)
             total_sub = len(X_sub)
 
             rng = np.random.default_rng(seed)

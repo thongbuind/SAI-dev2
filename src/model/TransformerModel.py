@@ -24,11 +24,6 @@ class TransformerModel(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight
 
-        causal = torch.triu(
-            torch.full((max_seq_len, max_seq_len), float('-inf')), diagonal=1
-        )
-        self.register_buffer("causal_mask", causal, persistent=False)
-
         self._init_weights()
 
     def _init_weights(self):
@@ -41,7 +36,9 @@ class TransformerModel(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def _build_attn_mask(self, T: int, pad_mask, device):
-        attn_mask = self.causal_mask[:T, :T][None, None, :, :]
+        attn_mask = torch.triu(
+            torch.full((T, T), float('-inf'), device=device), diagonal=1
+        )[None, None, :, :]
         if pad_mask is not None:
             pad = torch.zeros(pad_mask.shape[0], 1, 1, T, device=device)
             pad.masked_fill_(~pad_mask[:, None, None, :], float('-inf'))
@@ -51,22 +48,16 @@ class TransformerModel(nn.Module):
     def forward_features(self, input_ids: torch.Tensor, attention_mask=None, has_padding: bool = True) -> torch.Tensor:
         """Giống forward() nhưng DỪNG TRƯỚC lm_head — dùng cho training loss chunked
         (tránh vật lý hóa logits full (B*T, vocab_size))."""
-        pad_mask = attention_mask.bool() if attention_mask is not None \
-                   else (input_ids != self.pad_token_id)
-        B, T = input_ids.shape
+        _, T = input_ids.shape
         x = self.embed(input_ids)
         pos = torch.arange(T, device=input_ids.device)
         cos, sin = self.rope.get_cos_sin(pos)
 
-        # Chỉ build mask (và cộng pad-bias) khi batch này thực sự có token PAD.
-        # Nếu không có PAD, causal mask thuần == causal+pad mask về mặt toán học
-        # (pad-bias toàn số 0) -> bỏ qua an toàn, không đổi kết quả.
-        # has_padding được tính sẵn trên CPU trong collate_fn nên không tốn sync GPU ở đây.
-        attn_mask = self._build_attn_mask(T, pad_mask, x.device) if has_padding else None
+        attn_mask = None
 
         for block in self.blocks:
             x = block(x, cos, sin, attn_mask)
-        return self.norm(x)  # (B, T, d_model) — CHƯA qua lm_head
+        return self.norm(x)  # (B, T, d_model)
 
     def forward(self, input_ids: torch.Tensor, attention_mask=None, has_padding: bool = True) -> torch.Tensor:
         x = self.forward_features(input_ids, attention_mask, has_padding)

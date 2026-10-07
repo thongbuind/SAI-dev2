@@ -1,7 +1,127 @@
 import torch
 import time
 import json
+import gc
 from pathlib import Path
+
+DEFAULT_MAX_MICROBATCH_TOKENS = 57_600
+VRAM_PROFILE_STEPS = 20
+
+def get_adaptive_microbatch_shape(
+    logical_batch_size: int,
+    padded_length: int,
+    max_microbatch_tokens: int = DEFAULT_MAX_MICROBATCH_TOKENS,
+):
+    """Trả về (số microbatch, kích thước microbatch cân bằng)."""
+    microbatch_count = max(
+        1,
+        (logical_batch_size * padded_length + max_microbatch_tokens - 1)
+        // max_microbatch_tokens,
+    )
+    microbatch_count = min(logical_batch_size, microbatch_count)
+    microbatch_size = (
+        logical_batch_size + microbatch_count - 1
+    ) // microbatch_count
+    microbatch_count = (
+        logical_batch_size + microbatch_size - 1
+    ) // microbatch_size
+    return microbatch_count, microbatch_size
+
+def cuda_memory_gib():
+    """Chụp VRAM sau khi đồng bộ, tách tensor đang sống và allocator cache."""
+    torch.cuda.synchronize()
+    gib = 1024 ** 3
+    return {
+        "allocated": torch.cuda.memory_allocated() / gib,
+        "reserved": torch.cuda.memory_reserved() / gib,
+        "peak_allocated": torch.cuda.max_memory_allocated() / gib,
+        "peak_reserved": torch.cuda.max_memory_reserved() / gib,
+    }
+
+def format_vram_mark(mark):
+    return f"A={mark['allocated']:.2f}GiB/R={mark['reserved']:.2f}GiB"
+
+def print_vram_profile(
+    batch_idx, batch_shape, has_padding, optimizer_updated,
+    microbatch_count, microbatch_size, marks,
+):
+    peak = marks["released"]
+    timeline = " | ".join(
+        f"{name}:{format_vram_mark(marks[name])}"
+        for name in ("start", "h2d", "forward", "loss", "backward", "update", "released")
+    )
+    print()
+    print(
+        f"[VRAM] batch={batch_idx + 1} B={batch_shape[0]} T={batch_shape[1]} "
+        f"padding={has_padding} micro={microbatch_count}x<={microbatch_size} "
+        f"optimizer_step={optimizer_updated} | {timeline} | "
+        f"PEAK A={peak['peak_allocated']:.2f}GiB/R={peak['peak_reserved']:.2f}GiB"
+    )
+
+def build_sft_val_test_loaders(
+    phase_name, main_data, sub_data, train_ratio, val_ratio,
+    batch_size, max_seq_len, num_workers,
+):
+    """Dựng validation/test loader cố định cho một pha SFT."""
+    from src.data.Dataset import Dataset, split_train_val_test, load_data
+
+    X, Y, loss_mask, lengths = load_data(phase_name, main_data, sub_data)
+    X_train, Y_train, mask_train, len_train, \
+    X_val, Y_val, mask_val, len_val, \
+    X_test, Y_test, mask_test, len_test = split_train_val_test(
+        X, Y, loss_mask, lengths, train_ratio, val_ratio
+    )
+
+    val_ds = Dataset.create_dataloader(
+        X_val, Y_val, len_val, batch_size, max_seq_len, num_workers,
+        shuffle=False, mode="finetune", loss_masks=mask_val,
+    )
+    test_ds = Dataset.create_dataloader(
+        X_test, Y_test, len_test, batch_size, max_seq_len, num_workers,
+        shuffle=False, mode="finetune", loss_masks=mask_test,
+    )
+    sizes = (len(X_train), len(X_val), len(X_test))
+
+    del X_train, Y_train, mask_train, len_train
+    del X_val, Y_val, mask_val, len_val
+    del X_test, Y_test, mask_test, len_test
+    del X, Y, loss_mask, lengths
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return val_ds, test_ds, *sizes
+
+def build_sft_train_loader_epoch(
+    phase_name, main_data, sub_data, train_ratio, val_ratio,
+    batch_size, max_seq_len, num_workers, epoch=0,
+):
+    """Dựng random train loader cho một epoch SFT, không dùng sortish."""
+    from src.data.Dataset import Dataset, split_train_val_test, load_data
+
+    X, Y, loss_mask, lengths = load_data(
+        phase_name, main_data, sub_data, seed=epoch
+    )
+    X_train, Y_train, mask_train, len_train, \
+    X_val, Y_val, mask_val, len_val, \
+    X_test, Y_test, mask_test, len_test = split_train_val_test(
+        X, Y, loss_mask, lengths, train_ratio, val_ratio
+    )
+
+    train_ds = Dataset.create_dataloader(
+        X_train, Y_train, len_train, batch_size, max_seq_len, num_workers,
+        shuffle=True, mode="finetune", loss_masks=mask_train,
+    )
+
+    del X_val, Y_val, mask_val, len_val
+    del X_test, Y_test, mask_test, len_test
+    del X_train, Y_train, mask_train, len_train
+    del X, Y, loss_mask, lengths
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return train_ds
 
 def get_step_lr_lambda(warmup_steps, total_steps):
     def lr_lambda(current_step):
@@ -28,8 +148,10 @@ def log_progress(text):
     formatted_text = f"║ {text:<{fixed_width}} ║"
     print(formatted_text)
 
-def save_checkpoint(path: Path, epoch: int, global_step: int, model, optimizer, scheduler, best_val_loss: float):
-    """Save full training state so training can be resumed exactly."""
+def save_checkpoint(path: Path, epoch: int, global_step: int, model, optimizer, scheduler, best_val_loss: float, batches_done=None, sampler_state=None):
+    """Save full training state so training can be resumed exactly.
+    batches_done=None nghĩa là epoch đã xong; ngược lại là số batch đã train trong epoch."""
+    tmp_path = path.with_name(path.name + ".tmp")
     torch.save({
         "epoch": epoch,
         "global_step": global_step,
@@ -37,20 +159,31 @@ def save_checkpoint(path: Path, epoch: int, global_step: int, model, optimizer, 
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "best_val_loss": best_val_loss,
-    }, path)
+        "batches_done": batches_done,
+        "sampler_state": sampler_state,
+    }, tmp_path)
+    tmp_path.replace(path)
 
 
 def load_checkpoint(path: Path, model, optimizer, scheduler, device):
-    """Load full training state. Returns (start_epoch, global_step, best_val_loss)."""
+    """Load full training state. Returns (start_epoch, global_step, best_val_loss, resume_batch_idx, sampler_state)."""
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    start_epoch = ckpt["epoch"] + 1
+    batches_done = ckpt.get("batches_done")
+    if batches_done is None:
+        start_epoch = ckpt["epoch"] + 1
+        resume_batch_idx = 0
+    else:
+        start_epoch = ckpt["epoch"]
+        resume_batch_idx = batches_done
     global_step = ckpt["global_step"]
     best_val_loss = ckpt["best_val_loss"]
     log_progress(f"Resumed from checkpoint: epoch {ckpt['epoch']+1}, step {global_step}, best_val_loss {best_val_loss:.5f}")
-    return start_epoch, global_step, best_val_loss
+    if resume_batch_idx > 0:
+        log_progress(f"Resume giữa epoch: bỏ qua {resume_batch_idx} batch đã train")
+    return start_epoch, global_step, best_val_loss, resume_batch_idx, ckpt.get("sampler_state")
 
 def format_time(seconds: float) -> str:
     h = int(seconds // 3600)
@@ -103,8 +236,8 @@ class TflopsBenchmarker:
         total_batches_per_epoch: int,
         epochs: int,
         device: torch.device,
-        warmup_steps: int = 100,
-        target_steps: int = 500,
+        warmup_steps: int = 500,
+        target_steps: int = 1000,
     ):
         self.flops_per_token = flops_per_token
         self.total_flops_needed = total_flops_needed
@@ -180,7 +313,7 @@ class TflopsBenchmarker:
         self.reported = True
 
 class KernelLogger:
-    def __init__(self, enabled: bool = False, log_step: int = 500):
+    def __init__(self, enabled: bool = False, log_step: int = 1000):
         self.enabled = enabled
         self.log_step = log_step
         self.reported = not enabled
@@ -212,6 +345,8 @@ class KernelLogger:
 
         self._prof_ctx.__exit__(None, None, None)
 
+        # Gom theo operator + input shape để chẩn đoán GEMM/Linear shape
+        # mà không phải lưu timeline gồm hàng triệu event.
         key_avgs = self._prof_ctx.key_averages(group_by_input_shape=True)
 
         def _self_cuda_us(e):
@@ -263,7 +398,7 @@ class KernelLogger:
             key=lambda r: (r["self_cuda_ms"], r["self_cpu_ms"]),
             reverse=True,
         )
-        rows = rows[:100]
+        rows = rows[:20]
 
         print()
         print("╠════════════════════════════════════════════════════════════════════════════════════╣")
@@ -308,7 +443,7 @@ class KernelLogger:
             "filters": {
                 "min_cuda_pct": 0.1,
                 "min_cpu_pct": 1.0,
-                "max_rows": 100,
+                "max_rows": 20,
             },
             "operators": rows,
         }
