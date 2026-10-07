@@ -1,0 +1,11 @@
+{
+    "d_model": 1024,
+    "num_heads": 16,
+    "num_kv_heads": 4,
+    "num_layers": 24,
+    "ff_dim": 4096,
+    "batch_size": 64,
+    "max_microbatch_tokens": 16384,
+    "freeze": [0, 1, 2, 3],
+    "num_workers": 1
+}
